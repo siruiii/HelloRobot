@@ -11,17 +11,10 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-import stretch_body.robot
-
-
 LISTEN_ADDRESS = "0.0.0.0"
 LISTEN_PORT = 5005
 
-WATCHDOG_TIMEOUT_SECONDS = 0.25
 SOCKET_POLL_TIMEOUT_SECONDS = 0.02
-
-MAX_LINEAR_VELOCITY = 0.08   # meters/second
-MAX_ANGULAR_VELOCITY = 0.30  # radians/second
 
 
 @dataclass
@@ -79,8 +72,6 @@ def decode_command(packet: bytes) -> TeleopCommand:
 
 class StretchTeleop:
     def __init__(self) -> None:
-        self.robot = stretch_body.robot.Robot()
-
         self.socket = socket.socket(
             socket.AF_INET,
             socket.SOCK_DGRAM,
@@ -94,144 +85,59 @@ class StretchTeleop:
         )
 
         self.running = True
-        self.motion_active = False
-
-        self.active_session: str | None = None
-        self.last_sequence = -1
-        self.last_packet_time = 0.0
-        self.last_sender: tuple[str, int] | None = None
+        self.packet_count = 0
 
     def start(self) -> None:
-        if not self.robot.startup():
-            raise RuntimeError("Could not start Stretch hardware")
-
-        # Newer Stretch Body versions use is_homed().
-        if hasattr(self.robot, "is_homed"):
-            if not self.robot.is_homed():
-                raise RuntimeError(
-                    "Stretch is not homed. Home it before teleoperation."
-                )
-        elif hasattr(self.robot, "is_calibrated"):
-            if not self.robot.is_calibrated():
-                raise RuntimeError(
-                    "Stretch is not calibrated/homed."
-                )
-
         self.socket.bind((LISTEN_ADDRESS, LISTEN_PORT))
         self.socket.settimeout(SOCKET_POLL_TIMEOUT_SECONDS)
 
         print(
-            f"Listening on UDP {LISTEN_ADDRESS}:{LISTEN_PORT}",
+            f"Listening on UDP {LISTEN_ADDRESS}:{LISTEN_PORT} "
+            "(print-only mode, robot not controlled)",
             flush=True,
         )
 
-    def stop_base(self) -> None:
-        self.robot.base.set_velocity(0.0, 0.0)
-        self.robot.push_command()
+    def print_packet(
+        self,
+        packet: bytes,
+        sender: tuple[str, int],
+    ) -> None:
+        self.packet_count += 1
+        timestamp = time.strftime("%H:%M:%S")
 
-        if self.motion_active:
-            print("Base stopped", flush=True)
-
-        self.motion_active = False
-
-    def apply_command(self, command: TeleopCommand) -> None:
-        if not command.enabled:
-            self.stop_base()
-            return
-
-        linear_velocity = (
-            command.left_y * MAX_LINEAR_VELOCITY
-        )
-
-        angular_velocity = (
-            -command.left_x * MAX_ANGULAR_VELOCITY
-        )
-
-        self.robot.base.set_velocity(
-            linear_velocity,
-            angular_velocity,
-        )
-        self.robot.push_command()
-
-        self.motion_active = (
-            abs(linear_velocity) > 0.001
-            or abs(angular_velocity) > 0.001
-        )
-
-        # The remaining controller values are available here:
-        #
-        # command.right_x
-        # command.right_y
-        # command.trigger
-        #
-        # Add arm, lift, and gripper control only after the
-        # base and watchdog have been tested thoroughly.
-
-    def accept_sequence(self, command: TeleopCommand) -> bool:
-        # A new Unity launch creates a new session ID, so its
-        # sequence counter may safely restart from zero.
-        if command.session != self.active_session:
+        try:
+            command = decode_command(packet)
+        except (
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            TypeError,
+            ValueError,
+        ) as exception:
             print(
-                f"New controller session: {command.session}",
+                f"[{timestamp}] #{self.packet_count} from {sender[0]}:{sender[1]} "
+                f"raw={packet!r} (decode failed: {exception})",
                 flush=True,
             )
-
-            self.stop_base()
-            self.active_session = command.session
-            self.last_sequence = -1
-
-        if command.sequence <= self.last_sequence:
-            return False
-
-        self.last_sequence = command.sequence
-        return True
-
-    def check_watchdog(self) -> None:
-        if self.last_packet_time == 0.0:
             return
 
-        packet_age = time.monotonic() - self.last_packet_time
-
-        if packet_age > WATCHDOG_TIMEOUT_SECONDS:
-            self.stop_base()
-
-            # Reset so that the timeout is not printed continuously.
-            self.last_packet_time = 0.0
-
-            print(
-                "Watchdog timeout: controller stream lost",
-                flush=True,
-            )
+        print(
+            f"[{timestamp}] #{self.packet_count} from {sender[0]}:{sender[1]} "
+            f"session={command.session!r} seq={command.sequence} "
+            f"enabled={command.enabled} "
+            f"left=({command.left_x:+.3f}, {command.left_y:+.3f}) "
+            f"right=({command.right_x:+.3f}, {command.right_y:+.3f}) "
+            f"trigger={command.trigger:.3f}",
+            flush=True,
+        )
 
     def run(self) -> None:
         while self.running:
             try:
                 packet, sender = self.socket.recvfrom(2048)
-
-                command = decode_command(packet)
-
-                if not self.accept_sequence(command):
-                    continue
-
-                self.last_sender = sender
-                self.last_packet_time = time.monotonic()
-
-                self.apply_command(command)
+                self.print_packet(packet, sender)
 
             except socket.timeout:
                 pass
-
-            except (
-                UnicodeDecodeError,
-                json.JSONDecodeError,
-                TypeError,
-                ValueError,
-            ) as exception:
-                print(
-                    f"Rejected packet: {exception}",
-                    file=sys.stderr,
-                    flush=True,
-                )
 
             except OSError as exception:
                 if self.running:
@@ -241,26 +147,12 @@ class StretchTeleop:
                         flush=True,
                     )
 
-            self.check_watchdog()
-
     def shutdown(self) -> None:
         if not self.running:
             return
 
         self.running = False
-
-        try:
-            self.stop_base()
-        except Exception as exception:
-            print(
-                f"Could not stop base cleanly: {exception}",
-                file=sys.stderr,
-            )
-
-        try:
-            self.socket.close()
-        finally:
-            self.robot.stop()
+        self.socket.close()
 
 
 def main() -> None:

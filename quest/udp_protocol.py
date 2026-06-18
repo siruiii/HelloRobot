@@ -53,6 +53,24 @@ def finite_float(
     return value
 
 
+def parse_bool(value: Any, default: bool = False) -> bool:
+    """Parse JSON booleans that may arrive as bool, 0/1, or strings."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return default
+
+
+def decode_enabled(payload: dict[str, Any]) -> bool:
+    """Read the Quest app's explicit teleop-armed flag (often always false)."""
+    if "enabled" not in payload:
+        return False
+    return parse_bool(payload["enabled"])
+
+
 def finite_bool(
     payload: dict[str, Any],
     key: str,
@@ -61,7 +79,7 @@ def finite_bool(
     if key not in payload:
         return default
 
-    return bool(payload[key])
+    return parse_bool(payload[key], default=default)
 
 
 def decode_hand(
@@ -113,7 +131,7 @@ def decode_command(packet: bytes) -> TeleopCommand:
     return TeleopCommand(
         session=session,
         sequence=int(payload.get("sequence", -1)),
-        enabled=bool(payload.get("enabled", False)),
+        enabled=decode_enabled(payload),
         left=decode_hand(payload, "left", left_x, left_y),
         right=decode_hand(payload, "right", right_x, right_y, legacy_trigger),
     )

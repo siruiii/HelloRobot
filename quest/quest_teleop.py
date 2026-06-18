@@ -56,9 +56,12 @@ WATCHDOG_TIMEOUT_SECONDS = 0.25
 SOCKET_POLL_TIMEOUT_SECONDS = 0.02
 
 
-def command_to_gamepad_state(command: TeleopCommand) -> dict[str, Any]:
+def command_to_gamepad_state(
+    command: TeleopCommand,
+    require_enabled: bool = False,
+) -> dict[str, Any]:
     """Map decoded Quest UDP input to Stretch gamepad_state (test_w_gamepad)."""
-    if not command.enabled:
+    if require_enabled and not command.enabled:
         return dict(DEFAULT_STATE)
 
     left = command.left
@@ -97,12 +100,14 @@ class UdpGamepadController(threading.Thread):
         listen_address: str = LISTEN_ADDRESS,
         listen_port: int = LISTEN_PORT,
         print_packets: bool = False,
+        require_enabled: bool = False,
     ) -> None:
         super().__init__(name=self.__class__.__name__)
         self.daemon = True
         self.listen_address = listen_address
         self.listen_port = listen_port
         self.print_packets = print_packets
+        self.require_enabled = require_enabled
 
         self.lock = threading.Lock()
         self.stop_thread = False
@@ -186,7 +191,10 @@ class UdpGamepadController(threading.Thread):
                 if not self._accept_sequence(command):
                     continue
 
-                new_state = command_to_gamepad_state(command)
+                new_state = command_to_gamepad_state(
+                    command,
+                    require_enabled=self.require_enabled,
+                )
                 with self.lock:
                     self.gamepad_state.clear()
                     self.gamepad_state.update(new_state)
@@ -247,6 +255,7 @@ class QuestUdpGamePadTeleop(gamepad_teleop_module.GamePadTeleop):
         listen_address: str = LISTEN_ADDRESS,
         listen_port: int = LISTEN_PORT,
         print_packets: bool = False,
+        require_enabled: bool = False,
         collision_mgmt: bool = True,
     ) -> None:
         super().__init__(
@@ -258,6 +267,7 @@ class QuestUdpGamePadTeleop(gamepad_teleop_module.GamePadTeleop):
             listen_address=listen_address,
             listen_port=listen_port,
             print_packets=print_packets,
+            require_enabled=require_enabled,
         )
         self.controller_state = self.gamepad_controller.gamepad_state
 
@@ -298,6 +308,15 @@ def parse_args() -> argparse.Namespace:
         help="Print each accepted UDP packet.",
     )
     parser.add_argument(
+        "--require-enabled",
+        action="store_true",
+        help=(
+            "Only drive the robot when the Quest packet has enabled=true. "
+            "By default, stick/button inputs are always applied (like "
+            "test_w_gamepad.py); the enabled field is shown for debugging only."
+        ),
+    )
+    parser.add_argument(
         "--no-collision-mgmt",
         action="store_true",
         help="Disable stretch_body collision management.",
@@ -314,11 +333,18 @@ def main() -> int:
         "Press Ctrl+C to quit.",
         flush=True,
     )
+    if not args.require_enabled:
+        print(
+            "Note: Quest 'enabled' in UDP packets is ignored by default "
+            "(often false from the app). Use --require-enabled to gate motion.",
+            flush=True,
+        )
 
     teleop = QuestUdpGamePadTeleop(
         listen_address=args.address,
         listen_port=args.port,
         print_packets=args.verbose,
+        require_enabled=args.require_enabled,
         collision_mgmt=not args.no_collision_mgmt,
     )
 

@@ -7,14 +7,10 @@ Uses the same joint mapping as ``tests/test_w_gamepad.py`` and the official
 Quest controller -> gamepad mapping:
   Left thumbstick            base tank drive
   Right thumbstick X / Y     arm / lift
-  Left grip button           wrist yaw left  (LB)
-  Right grip button          wrist yaw right (RB)
-  Left index trigger         precision mode
-  Right index trigger        fast base mode
-  Right primary (A)          gripper close
-  Right secondary (B)        gripper open
-  Left primary (X)           toggle D-pad head vs dex wrist
-  Left secondary (Y, hold)   stow
+  Left index trigger         wrist yaw one direction (LB)
+  Right index trigger        wrist yaw opposite direction (RB)
+
+Unmapped for now (reserved): grip, precision/fast base, face buttons.
 
 Requirements:
   - Robot homed: ``stretch_robot_home.py``
@@ -54,6 +50,7 @@ LISTEN_PORT = 5005
 
 WATCHDOG_TIMEOUT_SECONDS = 0.25
 SOCKET_POLL_TIMEOUT_SECONDS = 0.02
+TRIGGER_WRIST_THRESHOLD = 0.5
 
 
 def command_to_gamepad_state(
@@ -75,16 +72,20 @@ def command_to_gamepad_state(
         "right_stick_y": _apply_dead_zone(-right.y),
         "left_stick_button_pressed": False,
         "right_stick_button_pressed": False,
-        "bottom_button_pressed": right.primary_button,
-        "top_button_pressed": left.secondary_button,
-        "left_button_pressed": left.primary_button,
-        "right_button_pressed": right.secondary_button,
-        "left_shoulder_button_pressed": left.grip_button,
-        "right_shoulder_button_pressed": right.grip_button,
+        "bottom_button_pressed": False,
+        "top_button_pressed": False,
+        "left_button_pressed": False,
+        "right_button_pressed": False,
+        "left_shoulder_button_pressed": (
+            left.trigger >= TRIGGER_WRIST_THRESHOLD
+        ),
+        "right_shoulder_button_pressed": (
+            right.trigger >= TRIGGER_WRIST_THRESHOLD
+        ),
         "select_button_pressed": False,
         "start_button_pressed": False,
-        "left_trigger_pulled": left.trigger,
-        "right_trigger_pulled": right.trigger,
+        "left_trigger_pulled": 0.0,
+        "right_trigger_pulled": 0.0,
         "bottom_pad_pressed": False,
         "top_pad_pressed": False,
         "left_pad_pressed": False,

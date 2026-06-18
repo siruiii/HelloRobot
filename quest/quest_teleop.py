@@ -27,13 +27,10 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
-import signal
 import socket
 import sys
 import threading
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -41,13 +38,16 @@ import stretch_body.gamepad_teleop as gamepad_teleop_module
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _TESTS_DIR = str(_REPO_ROOT / "tests")
-if _TESTS_DIR not in sys.path:
-    sys.path.insert(0, _TESTS_DIR)
+_QUEST_DIR = str(_REPO_ROOT / "quest")
+for _path in (_TESTS_DIR, _QUEST_DIR):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
 
 from bluetooth_gamepad_controller import (  # noqa: E402
     DEFAULT_STATE,
     _apply_dead_zone,
 )
+from udp_protocol import TeleopCommand, decode_command, format_command  # noqa: E402
 
 LISTEN_ADDRESS = "0.0.0.0"
 LISTEN_PORT = 5005
@@ -56,138 +56,32 @@ WATCHDOG_TIMEOUT_SECONDS = 0.25
 SOCKET_POLL_TIMEOUT_SECONDS = 0.02
 
 
-@dataclass
-class HandCommand:
-    x: float
-    y: float
-    trigger: float
-    grip: float
-    grip_button: bool
-    primary_button: bool
-    secondary_button: bool
-
-
-@dataclass
-class TeleopCommand:
-    session: str
-    sequence: int
-    enabled: bool
-    left: HandCommand
-    right: HandCommand
-
-    @property
-    def trigger(self) -> float:
-        """Backward-compatible alias for the right index trigger."""
-        return self.right.trigger
-
-
-def clamp(value: float, minimum: float, maximum: float) -> float:
-    return max(minimum, min(maximum, value))
-
-
-def finite_float(
-    payload: dict[str, Any],
-    key: str,
-    default: float = 0.0,
-) -> float:
-    value = float(payload.get(key, default))
-
-    if not math.isfinite(value):
-        raise ValueError(f"{key} must be finite")
-
-    return value
-
-
-def finite_bool(
-    payload: dict[str, Any],
-    key: str,
-    default: bool = False,
-) -> bool:
-    if key not in payload:
-        return default
-
-    return bool(payload[key])
-
-
-def decode_hand(
-    payload: dict[str, Any],
-    prefix: str,
-    legacy_x: float,
-    legacy_y: float,
-    legacy_trigger: float | None = None,
-) -> HandCommand:
-    trigger_key = f"{prefix}_trigger"
-    if legacy_trigger is not None and trigger_key not in payload:
-        trigger = legacy_trigger
-    else:
-        trigger = finite_float(payload, trigger_key)
-
-    return HandCommand(
-        x=clamp(finite_float(payload, f"{prefix}_x", legacy_x), -1.0, 1.0),
-        y=clamp(finite_float(payload, f"{prefix}_y", legacy_y), -1.0, 1.0),
-        trigger=clamp(trigger, 0.0, 1.0),
-        grip=clamp(finite_float(payload, f"{prefix}_grip"), 0.0, 1.0),
-        grip_button=finite_bool(payload, f"{prefix}_grip_button"),
-        primary_button=finite_bool(payload, f"{prefix}_primary_button"),
-        secondary_button=finite_bool(payload, f"{prefix}_secondary_button"),
-    )
-
-
-def decode_command(packet: bytes) -> TeleopCommand:
-    if len(packet) > 2048:
-        raise ValueError("Packet is too large")
-
-    payload = json.loads(packet.decode("utf-8"))
-
-    session = str(payload.get("session", ""))
-
-    if not session or len(session) > 64:
-        raise ValueError("Invalid session")
-
-    left_x = finite_float(payload, "left_x")
-    left_y = finite_float(payload, "left_y")
-    right_x = finite_float(payload, "right_x")
-    right_y = finite_float(payload, "right_y")
-    legacy_trigger = finite_float(payload, "trigger")
-
-    if "enabled" in payload:
-        enabled = bool(payload["enabled"])
-    else:
-        # Match simple Quest packets that only send stick values.
-        enabled = True
-
-    return TeleopCommand(
-        session=session,
-        sequence=int(payload.get("sequence", -1)),
-        enabled=enabled,
-        left=decode_hand(payload, "left", left_x, left_y),
-        right=decode_hand(payload, "right", right_x, right_y, legacy_trigger),
-    )
-
-
 def command_to_gamepad_state(command: TeleopCommand) -> dict[str, Any]:
-    """Map Quest UDP input to Stretch gamepad_state (same as test_w_gamepad)."""
+    """Map decoded Quest UDP input to Stretch gamepad_state (test_w_gamepad)."""
     if not command.enabled:
         return dict(DEFAULT_STATE)
 
+    left = command.left
+    right = command.right
+
     return {
         "middle_led_ring_button_pressed": False,
-        "left_stick_x": _apply_dead_zone(command.left.x),
-        "left_stick_y": _apply_dead_zone(-command.left.y),
-        "right_stick_x": _apply_dead_zone(command.right.x),
-        "right_stick_y": _apply_dead_zone(-command.right.y),
+        "left_stick_x": _apply_dead_zone(left.x),
+        "left_stick_y": _apply_dead_zone(-left.y),
+        "right_stick_x": _apply_dead_zone(right.x),
+        "right_stick_y": _apply_dead_zone(-right.y),
         "left_stick_button_pressed": False,
         "right_stick_button_pressed": False,
-        "bottom_button_pressed": command.right.primary_button,
-        "top_button_pressed": command.left.secondary_button,
-        "left_button_pressed": command.left.primary_button,
-        "right_button_pressed": command.right.secondary_button,
-        "left_shoulder_button_pressed": command.left.grip_button,
-        "right_shoulder_button_pressed": command.right.grip_button,
+        "bottom_button_pressed": right.primary_button,
+        "top_button_pressed": left.secondary_button,
+        "left_button_pressed": left.primary_button,
+        "right_button_pressed": right.secondary_button,
+        "left_shoulder_button_pressed": left.grip_button,
+        "right_shoulder_button_pressed": right.grip_button,
         "select_button_pressed": False,
         "start_button_pressed": False,
-        "left_trigger_pulled": command.left.trigger,
-        "right_trigger_pulled": command.right.trigger,
+        "left_trigger_pulled": left.trigger,
+        "right_trigger_pulled": right.trigger,
         "bottom_pad_pressed": False,
         "top_pad_pressed": False,
         "left_pad_pressed": False,
@@ -252,7 +146,8 @@ class UdpGamepadController(threading.Thread):
         return True
 
     def _zero_state_locked(self) -> None:
-        self.gamepad_state = dict(DEFAULT_STATE)
+        self.gamepad_state.clear()
+        self.gamepad_state.update(DEFAULT_STATE)
         self.is_gamepad_dongle = False
 
     def _check_watchdog(self) -> None:
@@ -303,9 +198,7 @@ class UdpGamepadController(threading.Thread):
                 if self.print_packets:
                     print(
                         f"#{self.packet_count} from {sender[0]}:{sender[1]} "
-                        f"seq={command.sequence} enabled={command.enabled} "
-                        f"left=({command.left.x:+.2f},{command.left.y:+.2f}) "
-                        f"right=({command.right.x:+.2f},{command.right.y:+.2f})",
+                        f"{format_command(command)}",
                         flush=True,
                     )
 

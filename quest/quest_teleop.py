@@ -1,0 +1,438 @@
+#!/usr/bin/env python3
+"""Stretch teleop over UDP from a Quest (or Unity) controller.
+
+Uses the same joint mapping as ``tests/test_w_gamepad.py`` and the official
+``stretch_gamepad_teleop.py`` via ``stretch_body.gamepad_teleop.GamePadTeleop``.
+
+Quest controller -> gamepad mapping:
+  Left thumbstick            base tank drive
+  Right thumbstick X / Y     arm / lift
+  Left grip button           wrist yaw left  (LB)
+  Right grip button          wrist yaw right (RB)
+  Left index trigger         precision mode
+  Right index trigger        fast base mode
+  Right primary (A)          gripper close
+  Right secondary (B)        gripper open
+  Left primary (X)           toggle D-pad head vs dex wrist
+  Left secondary (Y, hold)   stow
+
+Requirements:
+  - Robot homed: ``stretch_robot_home.py``
+  - stretch_body installed on the robot PC
+
+Keep the runstop within reach. Long-press Back / PC shutdown is disabled.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import signal
+import socket
+import sys
+import threading
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import stretch_body.gamepad_teleop as gamepad_teleop_module
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_TESTS_DIR = str(_REPO_ROOT / "tests")
+if _TESTS_DIR not in sys.path:
+    sys.path.insert(0, _TESTS_DIR)
+
+from bluetooth_gamepad_controller import (  # noqa: E402
+    DEFAULT_STATE,
+    _apply_dead_zone,
+)
+
+LISTEN_ADDRESS = "0.0.0.0"
+LISTEN_PORT = 5005
+
+WATCHDOG_TIMEOUT_SECONDS = 0.25
+SOCKET_POLL_TIMEOUT_SECONDS = 0.02
+
+
+@dataclass
+class HandCommand:
+    x: float
+    y: float
+    trigger: float
+    grip: float
+    grip_button: bool
+    primary_button: bool
+    secondary_button: bool
+
+
+@dataclass
+class TeleopCommand:
+    session: str
+    sequence: int
+    enabled: bool
+    left: HandCommand
+    right: HandCommand
+
+    @property
+    def trigger(self) -> float:
+        """Backward-compatible alias for the right index trigger."""
+        return self.right.trigger
+
+
+def clamp(value: float, minimum: float, maximum: float) -> float:
+    return max(minimum, min(maximum, value))
+
+
+def finite_float(
+    payload: dict[str, Any],
+    key: str,
+    default: float = 0.0,
+) -> float:
+    value = float(payload.get(key, default))
+
+    if not math.isfinite(value):
+        raise ValueError(f"{key} must be finite")
+
+    return value
+
+
+def finite_bool(
+    payload: dict[str, Any],
+    key: str,
+    default: bool = False,
+) -> bool:
+    if key not in payload:
+        return default
+
+    return bool(payload[key])
+
+
+def decode_hand(
+    payload: dict[str, Any],
+    prefix: str,
+    legacy_x: float,
+    legacy_y: float,
+    legacy_trigger: float | None = None,
+) -> HandCommand:
+    trigger_key = f"{prefix}_trigger"
+    if legacy_trigger is not None and trigger_key not in payload:
+        trigger = legacy_trigger
+    else:
+        trigger = finite_float(payload, trigger_key)
+
+    return HandCommand(
+        x=clamp(finite_float(payload, f"{prefix}_x", legacy_x), -1.0, 1.0),
+        y=clamp(finite_float(payload, f"{prefix}_y", legacy_y), -1.0, 1.0),
+        trigger=clamp(trigger, 0.0, 1.0),
+        grip=clamp(finite_float(payload, f"{prefix}_grip"), 0.0, 1.0),
+        grip_button=finite_bool(payload, f"{prefix}_grip_button"),
+        primary_button=finite_bool(payload, f"{prefix}_primary_button"),
+        secondary_button=finite_bool(payload, f"{prefix}_secondary_button"),
+    )
+
+
+def decode_command(packet: bytes) -> TeleopCommand:
+    if len(packet) > 2048:
+        raise ValueError("Packet is too large")
+
+    payload = json.loads(packet.decode("utf-8"))
+
+    session = str(payload.get("session", ""))
+
+    if not session or len(session) > 64:
+        raise ValueError("Invalid session")
+
+    left_x = finite_float(payload, "left_x")
+    left_y = finite_float(payload, "left_y")
+    right_x = finite_float(payload, "right_x")
+    right_y = finite_float(payload, "right_y")
+    legacy_trigger = finite_float(payload, "trigger")
+
+    return TeleopCommand(
+        session=session,
+        sequence=int(payload.get("sequence", -1)),
+        enabled=bool(payload.get("enabled", False)),
+        left=decode_hand(payload, "left", left_x, left_y),
+        right=decode_hand(payload, "right", right_x, right_y, legacy_trigger),
+    )
+
+
+def command_to_gamepad_state(command: TeleopCommand) -> dict[str, Any]:
+    """Map Quest UDP input to Stretch gamepad_state (same as test_w_gamepad)."""
+    if not command.enabled:
+        return dict(DEFAULT_STATE)
+
+    return {
+        "middle_led_ring_button_pressed": False,
+        "left_stick_x": _apply_dead_zone(command.left.x),
+        "left_stick_y": _apply_dead_zone(-command.left.y),
+        "right_stick_x": _apply_dead_zone(command.right.x),
+        "right_stick_y": _apply_dead_zone(-command.right.y),
+        "left_stick_button_pressed": False,
+        "right_stick_button_pressed": False,
+        "bottom_button_pressed": command.right.primary_button,
+        "top_button_pressed": command.left.secondary_button,
+        "left_button_pressed": command.left.primary_button,
+        "right_button_pressed": command.right.secondary_button,
+        "left_shoulder_button_pressed": command.left.grip_button,
+        "right_shoulder_button_pressed": command.right.grip_button,
+        "select_button_pressed": False,
+        "start_button_pressed": False,
+        "left_trigger_pulled": command.left.trigger,
+        "right_trigger_pulled": command.right.trigger,
+        "bottom_pad_pressed": False,
+        "top_pad_pressed": False,
+        "left_pad_pressed": False,
+        "right_pad_pressed": False,
+    }
+
+
+class UdpGamepadController(threading.Thread):
+    """UDP listener that publishes gamepad_state for GamePadTeleop."""
+
+    def __init__(
+        self,
+        listen_address: str = LISTEN_ADDRESS,
+        listen_port: int = LISTEN_PORT,
+        print_packets: bool = False,
+    ) -> None:
+        super().__init__(name=self.__class__.__name__)
+        self.daemon = True
+        self.listen_address = listen_address
+        self.listen_port = listen_port
+        self.print_packets = print_packets
+
+        self.lock = threading.Lock()
+        self.stop_thread = False
+        self.shutdown_flag = threading.Event()
+        self.is_gamepad_dongle = False
+
+        self.gamepad_state = dict(DEFAULT_STATE)
+        self._socket: socket.socket | None = None
+
+        self.active_session: str | None = None
+        self.last_sequence = -1
+        self.last_packet_time = 0.0
+        self.packet_count = 0
+
+    def _accept_sequence(self, command: TeleopCommand) -> bool:
+        if command.session != self.active_session:
+            print(
+                f"New controller session: {command.session}",
+                flush=True,
+            )
+            self.active_session = command.session
+            self.last_sequence = -1
+
+        if command.sequence <= self.last_sequence:
+            return False
+
+        self.last_sequence = command.sequence
+        return True
+
+    def _zero_state_locked(self) -> None:
+        self.gamepad_state = dict(DEFAULT_STATE)
+        self.is_gamepad_dongle = False
+
+    def _check_watchdog(self) -> None:
+        if self.last_packet_time == 0.0:
+            return
+
+        packet_age = time.monotonic() - self.last_packet_time
+        if packet_age <= WATCHDOG_TIMEOUT_SECONDS:
+            return
+
+        with self.lock:
+            self._zero_state_locked()
+            self.last_packet_time = 0.0
+
+        print(
+            "Watchdog timeout: controller stream lost",
+            flush=True,
+        )
+
+    def run(self) -> None:
+        self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._socket.bind((self.listen_address, self.listen_port))
+        self._socket.settimeout(SOCKET_POLL_TIMEOUT_SECONDS)
+
+        print(
+            f"Listening on UDP {self.listen_address}:{self.listen_port}",
+            flush=True,
+        )
+
+        while not self.shutdown_flag.is_set() and not self.stop_thread:
+            try:
+                packet, sender = self._socket.recvfrom(2048)
+                command = decode_command(packet)
+
+                if not self._accept_sequence(command):
+                    continue
+
+                with self.lock:
+                    self.gamepad_state = command_to_gamepad_state(command)
+                    self.is_gamepad_dongle = True
+
+                self.last_packet_time = time.monotonic()
+                self.packet_count += 1
+
+                if self.print_packets:
+                    print(
+                        f"#{self.packet_count} from {sender[0]}:{sender[1]} "
+                        f"seq={command.sequence} enabled={command.enabled}",
+                        flush=True,
+                    )
+
+            except socket.timeout:
+                self._check_watchdog()
+
+            except (
+                UnicodeDecodeError,
+                json.JSONDecodeError,
+                TypeError,
+                ValueError,
+            ) as exception:
+                print(
+                    f"Rejected packet: {exception}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+            except OSError as exception:
+                if not self.shutdown_flag.is_set() and not self.stop_thread:
+                    print(
+                        f"Socket error: {exception}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+
+        if self._socket is not None:
+            self._socket.close()
+            self._socket = None
+
+        with self.lock:
+            self._zero_state_locked()
+
+    def stop(self) -> None:
+        if not self.stop_thread:
+            with self.lock:
+                self.stop_thread = True
+            self.shutdown_flag.set()
+
+
+class QuestUdpGamePadTeleop(gamepad_teleop_module.GamePadTeleop):
+    """GamePadTeleop driven by Quest UDP packets."""
+
+    def __init__(
+        self,
+        listen_address: str = LISTEN_ADDRESS,
+        listen_port: int = LISTEN_PORT,
+        print_packets: bool = False,
+        collision_mgmt: bool = True,
+    ) -> None:
+        super().__init__(
+            robot_instance=True,
+            print_dongle_status=False,
+            collision_mgmt=collision_mgmt,
+        )
+        self.gamepad_controller = UdpGamepadController(
+            listen_address=listen_address,
+            listen_port=listen_port,
+            print_packets=print_packets,
+        )
+        self.controller_state = self.gamepad_controller.gamepad_state
+
+    def manage_shutdown(self, robot) -> None:
+        """Disable the official long-press Back PC shutdown."""
+        if self.controller_state["select_button_pressed"]:
+            if not self._last_shutdwon_btn_press:
+                self._last_shutdwon_btn_press = time.time()
+            if time.time() - self._last_shutdwon_btn_press >= 2:
+                print(
+                    "Long Back press ignored "
+                    "(PC shutdown disabled in stretch_udp_teleop.py).",
+                    flush=True,
+                )
+                self._last_shutdwon_btn_press = None
+        else:
+            self._last_shutdwon_btn_press = None
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Teleoperate Stretch from Quest UDP controller packets.",
+    )
+    parser.add_argument(
+        "--address",
+        default=LISTEN_ADDRESS,
+        help=f"UDP listen address (default: {LISTEN_ADDRESS}).",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=LISTEN_PORT,
+        help=f"UDP listen port (default: {LISTEN_PORT}).",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print each accepted UDP packet.",
+    )
+    parser.add_argument(
+        "--no-collision-mgmt",
+        action="store_true",
+        help="Disable stretch_body collision management.",
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+
+    print("Starting Stretch Quest UDP teleop...")
+    print(
+        "Mapping matches test_w_gamepad.py / stretch_gamepad_teleop.py. "
+        "Press Ctrl+C to quit.",
+        flush=True,
+    )
+
+    teleop = QuestUdpGamePadTeleop(
+        listen_address=args.address,
+        listen_port=args.port,
+        print_packets=args.verbose,
+        collision_mgmt=not args.no_collision_mgmt,
+    )
+
+    teleop.startup()
+
+    robot = teleop.robot
+    if hasattr(robot, "is_homed"):
+        homed = robot.is_homed()
+    else:
+        homed = robot.is_calibrated()
+
+    if not homed:
+        print(
+            "WARNING: Robot is not homed. "
+            "Run stretch_robot_home.py before teleoperation.",
+            file=sys.stderr,
+        )
+
+    try:
+        teleop.mainloop()
+        return 0
+    except KeyboardInterrupt:
+        print("\nQuest UDP teleop interrupted.")
+        return 130
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        teleop.stop()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

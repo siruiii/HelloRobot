@@ -150,10 +150,16 @@ def decode_command(packet: bytes) -> TeleopCommand:
     right_y = finite_float(payload, "right_y")
     legacy_trigger = finite_float(payload, "trigger")
 
+    if "enabled" in payload:
+        enabled = bool(payload["enabled"])
+    else:
+        # Match simple Quest packets that only send stick values.
+        enabled = True
+
     return TeleopCommand(
         session=session,
         sequence=int(payload.get("sequence", -1)),
-        enabled=bool(payload.get("enabled", False)),
+        enabled=enabled,
         left=decode_hand(payload, "left", left_x, left_y),
         right=decode_hand(payload, "right", right_x, right_y, legacy_trigger),
     )
@@ -226,10 +232,23 @@ class UdpGamepadController(threading.Thread):
             self.active_session = command.session
             self.last_sequence = -1
 
-        if command.sequence <= self.last_sequence:
+        # Senders that omit sequence (default -1) or repeat a fixed value (e.g. 0)
+        # should still stream live input; only drop clearly stale packets.
+        if command.sequence < 0:
+            return True
+
+        if self.last_sequence >= 0 and command.sequence < self.last_sequence:
+            if self.print_packets:
+                print(
+                    f"Rejected stale packet seq={command.sequence} "
+                    f"(last={self.last_sequence})",
+                    flush=True,
+                )
             return False
 
-        self.last_sequence = command.sequence
+        if command.sequence > self.last_sequence:
+            self.last_sequence = command.sequence
+
         return True
 
     def _zero_state_locked(self) -> None:
@@ -272,8 +291,10 @@ class UdpGamepadController(threading.Thread):
                 if not self._accept_sequence(command):
                     continue
 
+                new_state = command_to_gamepad_state(command)
                 with self.lock:
-                    self.gamepad_state = command_to_gamepad_state(command)
+                    self.gamepad_state.clear()
+                    self.gamepad_state.update(new_state)
                     self.is_gamepad_dongle = True
 
                 self.last_packet_time = time.monotonic()
@@ -282,7 +303,9 @@ class UdpGamepadController(threading.Thread):
                 if self.print_packets:
                     print(
                         f"#{self.packet_count} from {sender[0]}:{sender[1]} "
-                        f"seq={command.sequence} enabled={command.enabled}",
+                        f"seq={command.sequence} enabled={command.enabled} "
+                        f"left=({command.left.x:+.2f},{command.left.y:+.2f}) "
+                        f"right=({command.right.x:+.2f},{command.right.y:+.2f})",
                         flush=True,
                     )
 

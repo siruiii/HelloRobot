@@ -1,0 +1,62 @@
+hellorobot1@hellorobot1-NUC8i5BEHS:~/HelloRobot/tests$ stretch_robot_home.py
+For use with S T R E T C H (R) from Hello Robot Inc.
+---------------------------------------------------------------------
+
+--------- Homing Head ----
+--------- Homing Lift ----
+Homing Lift...
+[INFO] [robot_monitor]: Wrist single tap: 104
+[INFO] [robot_monitor]: Base bump event
+[INFO] [robot_monitor]: Wrist single tap: 108
+[INFO] [robot_monitor]: Base bump event
+Hardstop detected at motor position (rad) 118.79318237304688
+Marking Lift position to 1.098273 (m)
+Marking Lift position to 0.000000 (m)
+[INFO] [robot_monitor]: Guarded contact lift
+[INFO] [robot_monitor]: Wrist single tap: 111
+[INFO] [robot_monitor]: Base bump event
+[INFO] [robot_monitor]: Base bump event
+Lift homing successful
+--------- Homing Arm ----
+Homing Arm...
+Hardstop detected at motor position (rad) -0.3848450183868408
+Marking Arm position to 0.000000 (m)
+[INFO] [robot_monitor]: Guarded contact arm
+[INFO] [robot_monitor]: Wrist single tap: 113
+[INFO] [robot_monitor]: Wrist single tap: 115
+[INFO] [robot_monitor]: Wrist single tap: 117
+Arm homing successful
+--------- Homing stretch_gripper ----
+Moving to first hardstop...
+[WARNING] [stretch_gripper]: Timed out moving to first hardstop. Exiting.
+--------- Homing wrist_yaw ----
+Moving to first hardstop...
+First hardstop contact at position (ticks): -7
+-----
+Homing offset was 4609
+Marking current position to zero ticks
+Homing offset is now  4604 (ticks)
+-----
+Current position (ticks): 61
+Moving to calibrated zero: (rad)
+hellorobot1@hellorobot1-NUC8i5BEHS:~/HelloRobot/tests$ stretch_system_check.py
+For use with S T R E T C H (R) from Hello Robot Inc.
+---------------------------------------------------------------------
+
+Model = Stretch RE1
+Tool = Standard Gripper
+Serial Number = stretch-re1-1029
+
+
+---- Checking Hardware ----
+[Pass] Comms are ready
+[Fail] Actuators not ready (robot not homed, run stretch_robot_home.py)
+[Pass] Sensors are ready
+[Pass] Battery voltage is 13.5 V
+
+---- Checking Software ----
+[Pass] Ubuntu 20.04 is ready
+[Warn] Not all APT pkgs are setup correctly (ros-noetic-librealsense2 should notbe installed)
+[Pass] Firmware is up-to-date
+[Warn] Python pkgs not up-to-date (run pip3 install -U hello-robot-stretch-diagnostics)
+[Pass] ROS Noetic is ready

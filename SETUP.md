@@ -23,7 +23,8 @@
    git pull
    ./stretch_new_robot_install.sh
   ```
-   The script takes 20–30 minutes to complete.
+   The script takes 20–30 minutes to complete. See [installation log](documentation-files/installation-log.txt) for a full log of a successful installation.
+
 
 Reference: [Run the new robot installation script](https://docs.hello-robot.com/0.2/stretch-install/docs/robot_install/)
 
@@ -74,7 +75,7 @@ stretch_system_check.py
 
 `stretch_robot_home.py` must complete successfully before running motion tests in `[tests/](tests/)`.
 
-Expected result: hardware, firmware, and Python packages report **Pass**. See [example terminal output](documentation-files/terminal-log.txt) and [complete homing procedure video](documentation-files/complete-homing-procedure-video.MOV)  from a successful homing and system check.
+Expected result: hardware, firmware, and Python packages report **Pass**. See [calibration log](documentation-files/calibration-log.txt) and [complete homing procedure video](documentation-files/complete-homing-procedure-video.MOV) from a successful homing and system check.
 
 ## VNC viewer setup
 
@@ -87,16 +88,16 @@ sudo apt update
 sudo apt install vino
 ```
 
-1. Enable screen sharing**
+2. Enable screen sharing
 
 Open **Settings → Sharing**:
 
-1. Turn **Sharing** on.
-2. Open **Screen Sharing**.
-3. Enable **Screen sharing**.
-4. Enable **Remote control**.
-5. Set a VNC password.
-6. Disable encryption requirement**
+a. Turn **Sharing** on.
+b. Open **Screen Sharing**.
+c. Enable **Screen sharing**.
+d. Enable **Remote control**.
+e. Set a VNC password.
+f. Disable encryption requirement**
 
 Some VNC clients cannot connect when encryption is required. Run:
 
@@ -104,7 +105,7 @@ Some VNC clients cannot connect when encryption is required. Run:
 gsettings set org.gnome.Vino require-encryption false
 ```
 
-1. Get the robot IP address**
+3. Get the robot IP address
 
 On the robot, run:
 

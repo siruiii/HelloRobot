@@ -126,9 +126,11 @@ class SafeGamePadTeleop(gamepad_teleop_module.GamePadTeleop):
         self._update_state(state)
         self._update_modes()
         with self.lock:
+            # _set_armed(False) stops all joints once on the transition.
+            # While disarmed nothing is commanded, so push_command() has no
+            # stepper motion to sync and the Pimu stays idle.
             if not robot.is_homed():
                 self._set_armed(False, robot, "robot not homed")
-                self._safety_stop(robot)
                 if self._i % 100 == 0:
                     print("Robot is not homed. Quit and run stretch_robot_home.py.")
                 return
@@ -138,7 +140,6 @@ class SafeGamePadTeleop(gamepad_teleop_module.GamePadTeleop):
             if self.armed and not self.currently_stowing:
                 self.command_robot_joints(robot)
             elif not self.currently_stowing:
-                self._safety_stop(robot)
                 if self._i % 150 == 0:
                     print("Disarmed. Press Start to enable teleop.")
 
@@ -211,7 +212,7 @@ def main():
         print("\nSafe gamepad teleop interrupted.")
         return 130
     except Exception as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
+        print(f"ERROR: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
     finally:
         try:
@@ -219,7 +220,14 @@ def main():
             teleop.robot.push_command()
         except Exception:
             pass
-        teleop.stop()
+        # Stop the gamepad thread first: robot.stop() can raise on a
+        # Dynamixel comm error and would otherwise skip this.
+        teleop.gamepad_controller.stop()
+        teleop.gamepad_controller.join(1)
+        try:
+            teleop.robot.stop()
+        except Exception as exc:
+            print(f"WARNING: error while stopping robot: {exc}", file=sys.stderr)
 
 
 if __name__ == "__main__":
